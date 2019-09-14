@@ -2,11 +2,16 @@ package com.springboot.es;
 
 import com.springboot.es.entity.Item;
 import com.springboot.es.repository.ItemRepository;
+import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.index.query.Operator;
 import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.search.SearchHits;
 import org.elasticsearch.search.aggregations.AggregationBuilders;
 import org.elasticsearch.search.aggregations.bucket.terms.StringTerms;
 import org.elasticsearch.search.aggregations.metrics.avg.InternalAvg;
+import org.elasticsearch.search.fetch.subphase.highlight.HighlightBuilder;
+import org.elasticsearch.search.fetch.subphase.highlight.HighlightField;
 import org.elasticsearch.search.sort.SortBuilders;
 import org.elasticsearch.search.sort.SortOrder;
 import org.junit.Test;
@@ -15,12 +20,17 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.elasticsearch.core.ElasticsearchTemplate;
+import org.springframework.data.elasticsearch.core.SearchResultMapper;
 import org.springframework.data.elasticsearch.core.aggregation.AggregatedPage;
+import org.springframework.data.elasticsearch.core.aggregation.impl.AggregatedPageImpl;
 import org.springframework.data.elasticsearch.core.query.NativeSearchQueryBuilder;
 import org.springframework.test.context.junit4.SpringJUnit4ClassRunner;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -127,7 +137,8 @@ Item{id=8, title='RedMi note7', category='智能手机', brand='红米', price=1
     @Test
     public void testFullQuery(){
         NativeSearchQueryBuilder queryBuilder = new NativeSearchQueryBuilder();
-        queryBuilder.withQuery(QueryBuilders.queryStringQuery("红米"));
+        queryBuilder.withIndices("items");
+        queryBuilder.withQuery(QueryBuilders.queryStringQuery("RedMi"));
         List<Item> items = elasticsearchTemplate.queryForList(queryBuilder.build(), Item.class);
         for(Item item : items){
             System.out.println(item);
@@ -292,6 +303,7 @@ Item{id=8, title='RedMi note7', category='智能手机', brand='红米', price=1
     @Test
     public void testRangeQuery() throws Exception{
         NativeSearchQueryBuilder queryBuilder = new NativeSearchQueryBuilder();
+        queryBuilder.withIndices("items");
         String start = "2017-01-01 00:00:00";
         String end = "2017-12-31 23:59:59";
         Date startDate = sdf.parse(start);
@@ -306,5 +318,111 @@ Item{id=8, title='RedMi note7', category='智能手机', brand='红米', price=1
             System.out.println(item);
         }
     }
+
+    /*
+    高亮查询
+     */
+    @Test
+    public void testHighlightQuery(){
+        NativeSearchQueryBuilder queryBuilder = new NativeSearchQueryBuilder();
+        //设置要检索的索引库
+        queryBuilder.withIndices("items");
+        queryBuilder.withQuery(QueryBuilders.queryStringQuery("RedMi"));
+
+        //高亮设置
+        List<String> hightlightFields = new ArrayList<String>();
+        hightlightFields.add("title");
+        hightlightFields.add("category");
+        hightlightFields.add("brand");
+        hightlightFields.add("price");
+
+        HighlightBuilder.Field[] fields = new HighlightBuilder.Field[hightlightFields.size()];
+        for(int x=0;x<hightlightFields.size();x++){
+            fields[x]= new HighlightBuilder.Field(hightlightFields.get(x))
+                        .preTags("<em>").postTags("</em>");
+        }
+
+        queryBuilder.withHighlightFields(fields);
+
+        queryBuilder.withPageable(PageRequest.of(0,1000));
+
+        AggregatedPage<Item> page = elasticsearchTemplate.queryForPage(queryBuilder.build(), Item.class, new SearchResultMapper() {
+            @Override
+            public <T> AggregatedPage<T> mapResults(SearchResponse response, Class<T> clazz, Pageable pageable) {
+                List<Item> list = new ArrayList<Item>();
+                SearchHit[] hits = response.getHits().getHits();
+                if (hits.length <= 0) {
+                    return null;
+                }
+                for (SearchHit searchHit : hits) {
+                    Item item = new Item();
+                    item.setId(Long.valueOf(searchHit.getId()));
+                    item.setTitle(String.valueOf(searchHit.getSourceAsMap().get("title")));
+                    item.setCategory(String.valueOf(searchHit.getSourceAsMap().get("category")));
+                    item.setBrand(String.valueOf(searchHit.getSourceAsMap().get("brand")));
+                    item.setPrice((Double) searchHit.getSourceAsMap().get("price"));
+                    item.setImages(String.valueOf(searchHit.getSourceAsMap().get("images")));
+
+                    Object date = searchHit.getSourceAsMap().get("date");
+                    if (date != null) {
+                        item.setDate(new Date(Long.valueOf(String.valueOf(date))));
+                    }
+                    // 反射调用set方法将高亮内容设置进去
+                    for (String field : hightlightFields) {
+                        HighlightField highlightField = searchHit.getHighlightFields().get(field);
+                        if (highlightField != null) {
+                            String setMethodName = parSetName(field);
+                            Class<? extends Item> itemClazz = item.getClass();
+                            Method[] methods = itemClazz.getMethods();
+                            for (Method method : methods) {
+                                if (setMethodName.equals(method.getName())) {
+                                    String highlightStr = highlightField.getFragments()[0].toString();
+                                    try {
+                                        method.invoke(item, highlightStr);
+                                    } catch (IllegalAccessException e) {
+                                        e.printStackTrace();
+                                    } catch (InvocationTargetException e) {
+                                        e.printStackTrace();
+                                    }
+                                    list.add(item);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (list.size() > 0) {
+                    AggregatedPage<T> result = new AggregatedPageImpl<T>((List<T>) list, pageable, response.getHits().getTotalHits());
+                    return result;
+                }
+
+                return null;
+            }
+        });
+        System.out.println("总记录数："+page.getTotalElements());
+        System.out.println("总页数："+page.getTotalPages());
+        System.out.println("当前页："+page.getNumber());
+
+        page.stream().forEach(System.out::println);
+    }
+
+    /**
+     * 拼接在某属性的 set方法
+     *
+     * @param fieldName
+     * @return String
+     */
+    private static String parSetName(String fieldName) {
+        if (null == fieldName || "".equals(fieldName)) {
+            return null;
+        }
+        int startIndex = 0;
+        if (fieldName.charAt(0) == '_')
+            startIndex = 1;
+        return "set" + fieldName.substring(startIndex, startIndex + 1).toUpperCase()
+                + fieldName.substring(startIndex + 1);
+    }
+
 
 }
